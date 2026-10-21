@@ -175,7 +175,9 @@ log "SUBNET=$SUBNET"
 
 # ---------------- image ----------------
 log "looking up Ubuntu 24.04 aarch64 image..."
-IMGS=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --shape VM.Standard.A1.Flex --output json)
+IMGS=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --shape VM.Standard.A1.Flex --output json 2>/dev/null)
+[ -n "$IMGS" ] || IMGS=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --output json 2>/dev/null)
+[ -n "$IMGS" ] || IMGS='{"data":[]}'
 IMG=$(echo "$IMGS" | jq -r '[.data[]|select(."display-name"|test("24.04"))|select(."display-name"|test("aarch64"))][0].id // empty')
 [ -n "$IMG" ] || IMG=$(echo "$IMGS" | jq -r '[.data[]|select(."display-name"|test("22.04"))|select(."display-name"|test("aarch64"))][0].id // empty')
 [ -n "$IMG" ] || IMG=$(echo "$IMGS" | jq -r '.data[0].id // empty')
