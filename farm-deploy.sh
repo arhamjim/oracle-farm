@@ -250,6 +250,7 @@ while [ -z "$INST" ]; do
     InvalidParameter|NotAuthorizedOrNotFound|Forbidden|QuotaExceeded)
       echo "[!] fatal launch error, not retrying:"; tail -25 /tmp/err; exit 1 ;;
     TooManyRequests|"Too many requests")
+      if [ "$MAX_TRIES" -eq 1 ]; then echo "[$(ts)] still throttled -- wait 10-15 min, then retry"; exit 3; fi
       rate=$((rate+1))
       w=$(( 120 * rate )); [ "$w" -gt 600 ] && w=600
       w=$(( w + RANDOM % 30 ))
