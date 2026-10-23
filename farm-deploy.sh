@@ -36,6 +36,16 @@ fi
 if [ -z "$C" ]; then
   C=$(oci iam compartment list --all --query 'data[0]."compartment-id"' --raw-output 2>/dev/null || true)
 fi
+if [ -z "$C" ]; then
+  C=$(oci iam region-subscription list --output json 2>/dev/null | jq -r '.data[0]."tenancy-id" // empty' || true)
+fi
+if [ -z "$C" ]; then
+  C=$(oci iam tenancy list --output json 2>/dev/null | jq -r '.data[0].id // empty' || true)
+fi
+if [ -z "$C" ] && [ -f "$HOME/.oci/config" ]; then
+  echo "--- ~/.oci/config keys (values hidden) ---"
+  sed -E 's/^([a-z_]+)=.*/\1=***/' "$HOME/.oci/config" 2>/dev/null || true
+fi
 [ -n "$C" ] && [ "$C" != "null" ] || die "could not resolve tenancy OCID (pass TENANCY=ocid1.tenancy... )"
 log "tenancy=$C"
 
