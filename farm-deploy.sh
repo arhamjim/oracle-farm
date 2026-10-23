@@ -66,10 +66,12 @@ fi
 log "AD=$AD"
 
 # ---------------- already deployed? ----------------
+# ---------------- already deployed? ----------------
 EXIST=$(oci compute instance list -c "$C" --display-name "${PREFIX}-server" --output json 2>/dev/null \
-        | jq -r '[.data[]|select(.id != null)][0].id // empty')
-if [ -n "$EXIST" ]; then
-  IP=$(oci compute instance list-vnics --instance-id "$EXIST" --output json | jq -r '.data[0]."public-ip" // empty')
+        | jq -r '[.data[]|select(."lifecycle-state"=="RUNNING" or ."lifecycle-state"=="PROVISIONING" or ."lifecycle-state"=="STARTING" or ."lifecycle-state"=="STOPPED")][0].id // empty' 2>/dev/null || true)
+EXIST="${EXIST:-}"
+if [ -n "$EXIST" ] && [ "$EXIST" != "null" ]; then
+  IP=$(oci compute instance list-vnics --instance-id "$EXIST" --output json 2>/dev/null | jq -r '.data[0]."public-ip" // empty' 2>/dev/null || true)
   log "instance already exists: $EXIST"
   echo
   echo "================ ALREADY DEPLOYED ================"
@@ -180,17 +182,29 @@ EOJ
 fi
 log "SL=$SL"
 
-SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" --output json \
-         | jq -r '.data[]|select(."display-name"=="farm-subnet")|.id' | head -1)
+SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" --output json 2>/dev/null \
+         | jq -r '.data[]|select(."display-name"=="farm-subnet")|.id' 2>/dev/null | head -1 || true)
+SUBNET="${SUBNET:-}"
 if [ -z "$SUBNET" ] || [ "$SUBNET" = "null" ]; then
-  log "creating subnet farm-subnet 10.0.1.0/24..."
-  SUBNET=$(oci network subnet create -c "$C" --vcn-id "$VCN" --cidr-block 10.0.1.0/24 \
-           --display-name farm-subnet --dns-label farmsub \
-           --route-table-id "$RT" --security-list-ids "[\"$SL\"]" \
-           --wait-for-state AVAILABLE --output json | jq -r .data.id)
+  USED=$(oci network subnet list -c "$C" --vcn-id "$VCN" --output json 2>/dev/null | jq -r '.data[]."cidr-block"' 2>/dev/null || true)
+  log "existing subnets: $(echo "$USED" | tr '\n' ' ')"
+  SUBNET=""
+  for oct in 100 101 102 110 120 130 140 150 160 170 180 190 200 210 220 230 240 250 2 3 4 5 6 7 8 9 10 20 30 40 50 60 70 80 90; do
+    cidr="10.0.${oct}.0/24"
+    if echo "$USED" | grep -qx "$cidr"; then continue; fi
+    log "trying subnet farm-subnet $cidr ..."
+    if SUBNET=$(oci network subnet create -c "$C" --vcn-id "$VCN" --cidr-block "$cidr" \
+         --display-name farm-subnet --dns-label "farm${oct}" \
+         --route-table-id "$RT" --security-list-ids "[\"$SL\"]" \
+         --wait-for-state AVAILABLE --output json 2>/tmp/suberr | jq -r '.data.id // empty' 2>/dev/null); then
+      [ -n "$SUBNET" ] && [ "$SUBNET" != "null" ] && break
+    fi
+    SUBNET=""
+    log "  -> $(grep -o '"message": "[^"]*"' /tmp/suberr 2>/dev/null | head -1 || echo 'failed, trying next cidr')"
+  done
 fi
+[ -n "$SUBNET" ] && [ "$SUBNET" != "null" ] || { echo "[!] could not create or find a subnet"; tail -5 /tmp/suberr 2>/dev/null; exit 1; }
 log "SUBNET=$SUBNET"
-
 # ---------------- image ----------------
 log "looking up Ubuntu 24.04 aarch64 image..."
 IMGS=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --shape VM.Standard.A1.Flex --output json 2>/dev/null)
@@ -205,27 +219,42 @@ log "IMAGE=$IMG"
 UD=$(base64 -w0 /tmp/ci.yaml)
 jq -n --arg k "$SSH_PUBKEY" --arg u "$UD" '{ssh_authorized_keys:$k, user_data:$u}' > /tmp/meta.json
 
-# ---------------- launch (retry on capacity) ----------------
-log "launching ${OCPUS} OCPU / ${MEMGB}GB VM.Standard.A1.Flex (retrying on capacity)..."
+# ---------------- launch (retry on capacity, ladder down if scarce) ----------------
 INST=""
-for i in $(seq 1 240); do
+i=0
+while [ -z "$INST" ]; do
+  i=$((i+1))
+  if [ "$i" -gt 240 ]; then break; fi
+  if   [ "$i" -le 40 ]; then cap=4.0; mem=24.0
+  elif [ "$i" -le 80 ]; then cap=2.0; mem=12.0
+  else                       cap=1.0; mem=6.0
+  fi
   if oci compute instance launch -c "$C" --availability-domain "$AD" --shape VM.Standard.A1.Flex \
-      --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMGB}" \
+      --shape-config "{\"ocpus\":$cap,\"memoryInGBs\":$mem}" \
       --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
       --display-name "${PREFIX}-server" --metadata file:///tmp/meta.json \
       --wait-for-state RUNNING --output json > /tmp/inst.json 2>/tmp/err; then
-    INST=$(jq -r .data.id /tmp/inst.json); break
+    INST=$(jq -r '.data.id // empty' /tmp/inst.json 2>/dev/null || true)
+    break
   fi
-  reason=$(grep -io 'Out of host capacity\|LimitExceeded\|InternalError\|InvalidParameter\|NotAuthenticated\|Forbidden' /tmp/err | head -1)
-  echo "[$(ts)] attempt $i: ${reason:-unknown error}"
+  INST=""
+  reason=$(grep -oE 'Out of host capacity|LimitExceeded|InternalError|InvalidParameter|NotAuthorizedOrNotFound|Forbidden|QuotaExceeded' /tmp/err 2>/dev/null | head -1 || true)
+  detail=$(grep -o '"message": "[^"]*"' /tmp/err 2>/dev/null | head -1 | cut -c12-120 || true)
+  echo "[$(ts)] attempt $i (${cap}ocpu/${mem}GB): ${detail:-${reason:-unknown error}}"
+  case "$reason" in
+    InvalidParameter|NotAuthorizedOrNotFound|Forbidden|QuotaExceeded)
+      echo "[!] fatal launch error, not retrying:"; tail -25 /tmp/err; exit 1 ;;
+  esac
   sleep 20
 done
-if [ -z "$INST" ]; then echo "[!] launch failed. Last error:"; tail -20 /tmp/err; exit 1; fi
+[ -n "$INST" ] || { echo "[!] gave up after $i attempts. Last error:"; tail -25 /tmp/err; exit 1; }
 
-IP=$(oci compute instance list-vnics --instance-id "$INST" --output json | jq -r '.data[0]."public-ip" // empty')
+IP=$(oci compute instance list-vnics --instance-id "$INST" --output json 2>/dev/null | jq -r '.data[0]."public-ip" // empty' 2>/dev/null || true)
+SHAPE=$(jq -r '.data."shape-config" | "\(.ocpus) OCPU / \(."memory-in-gbs") GB"' /tmp/inst.json 2>/dev/null || echo "")
 echo
 echo "================ DEPLOYED ================"
 echo "Instance OCID    : $INST"
+echo "Shape            : ${SHAPE:-VM.Standard.A1.Flex}"
 echo "Server public IP : ${IP:-<pending>}"
 echo "SSH              : ssh -i ~/.ssh/oci_farm ubuntu@${IP:-<ip>}"
 echo "Bootstrap runs   : ~3-5 min on first boot"
