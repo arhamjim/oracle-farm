@@ -220,35 +220,54 @@ UD=$(base64 -w0 /tmp/ci.yaml)
 jq -n --arg k "$SSH_PUBKEY" --arg u "$UD" '{ssh_authorized_keys:$k, user_data:$u}' > /tmp/meta.json
 
 # ---------------- launch (retry on capacity, ladder down if scarce) ----------------
-INST=""
-i=0
+# ---------------- launch (429-aware backoff, capacity ladder) ----------------
+MAX_TRIES="${MAX_TRIES:-240}"
+[ "${ONCE:-0}" = "1" ] && MAX_TRIES=1
+INST=""; i=0; rate=0
 while [ -z "$INST" ]; do
   i=$((i+1))
-  if [ "$i" -gt 240 ]; then break; fi
+  if [ "$i" -gt "$MAX_TRIES" ]; then break; fi
   if   [ "$i" -le 40 ]; then cap=4.0; mem=24.0
   elif [ "$i" -le 80 ]; then cap=2.0; mem=12.0
   else                       cap=1.0; mem=6.0
   fi
-  if oci compute instance launch -c "$C" --availability-domain "$AD" --shape VM.Standard.A1.Flex \
+  # keep total request rate low; OCI throttles bursts hard
+  oci compute instance launch -c "$C" --availability-domain "$AD" --shape VM.Standard.A1.Flex \
       --shape-config "{\"ocpus\":$cap,\"memoryInGBs\":$mem}" \
       --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
       --display-name "${PREFIX}-server" --metadata file:///tmp/meta.json \
-      --wait-for-state RUNNING --output json > /tmp/inst.json 2>/tmp/err; then
+      --output json > /tmp/inst.json 2>/tmp/err
+  rc=$?
+  if [ $rc -eq 0 ]; then
     INST=$(jq -r '.data.id // empty' /tmp/inst.json 2>/dev/null || true)
-    break
+    [ -n "$INST" ] && break
   fi
   INST=""
-  reason=$(grep -oE 'Out of host capacity|LimitExceeded|InternalError|InvalidParameter|NotAuthorizedOrNotFound|Forbidden|QuotaExceeded' /tmp/err 2>/dev/null | head -1 || true)
-  detail=$(grep -o '"message": "[^"]*"' /tmp/err 2>/dev/null | head -1 | cut -c12-120 || true)
-  echo "[$(ts)] attempt $i (${cap}ocpu/${mem}GB): ${detail:-${reason:-unknown error}}"
+  reason=$(grep -oE 'TooManyRequests|Too many requests|Out of host capacity|LimitExceeded|InternalError|InvalidParameter|NotAuthorizedOrNotFound|Forbidden|QuotaExceeded' /tmp/err 2>/dev/null | head -1 || true)
+  detail=$(grep -o '"message": "[^"]*"' /tmp/err 2>/dev/null | head -1 | cut -c12-140 || true)
+  echo "[$(ts)] attempt $i/${MAX_TRIES} (${cap}ocpu/${mem}GB): ${detail:-${reason:-unknown error}}"
   case "$reason" in
     InvalidParameter|NotAuthorizedOrNotFound|Forbidden|QuotaExceeded)
       echo "[!] fatal launch error, not retrying:"; tail -25 /tmp/err; exit 1 ;;
+    TooManyRequests|"Too many requests")
+      rate=$((rate+1))
+      w=$(( 120 * rate )); [ "$w" -gt 600 ] && w=600
+      w=$(( w + RANDOM % 30 ))
+      echo "[$(ts)] rate limited (hit #$rate) -> cooling down ${w}s"
+      sleep "$w" ;;
+    *)
+      sleep 20 ;;
   esac
-  sleep 20
 done
 [ -n "$INST" ] || { echo "[!] gave up after $i attempts. Last error:"; tail -25 /tmp/err; exit 1; }
 
+# wait for RUNNING without hammering the API
+log "instance created, waiting for RUNNING..."
+for _ in $(seq 1 60); do
+  st=$(oci compute instance get --instance-id "$INST" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || true)
+  [ "$st" = "RUNNING" ] && break
+  case "$st" in PROVISIONING|STARTING|"") sleep 10 ;; *) break ;; esac
+done
 IP=$(oci compute instance list-vnics --instance-id "$INST" --output json 2>/dev/null | jq -r '.data[0]."public-ip" // empty' 2>/dev/null || true)
 SHAPE=$(jq -r '.data."shape-config" | "\(.ocpus) OCPU / \(."memory-in-gbs") GB"' /tmp/inst.json 2>/dev/null || echo "")
 echo
