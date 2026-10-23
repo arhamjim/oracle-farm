@@ -31,7 +31,7 @@ log "auth OK ($(jq -r '.data|length' /tmp/regions.json) regions visible)"
 
 C="${TENANCY:-}"
 if [ -z "$C" ] && [ -f "$HOME/.oci/config" ]; then
-  C=$(grep -m1 '^tenancy=' "$HOME/.oci/config" | cut -d= -f2- | tr -d ' \r' || true)
+  C=$(grep -m1 -Ei '^[[:space:]]*tenancy[[:space:]]*=' "$HOME/.oci/config" | cut -d= -f2- | tr -d ' "\r' || true)
 fi
 if [ -z "$C" ]; then
   C=$(oci iam compartment list --all --query 'data[0]."compartment-id"' --raw-output 2>/dev/null || true)
