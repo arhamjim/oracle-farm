@@ -21,7 +21,7 @@ done
 SSH_PUBKEY="${SSH_PUBKEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKOGwprO9aJX5q2kkptbJZkto21s6xO2s+1CDOewtjEv oci-farm}"
 PREFIX="${PREFIX:-farm}"; OCPUS="${OCPUS:-4}"; MEMGB="${MEMGB:-24}"
 
-# ---------------- auth + tenancy ----------------
+# ---------------- auth + tenancy (verified) ----------------
 log "testing OCI CLI auth..."
 if ! oci iam region list --output json >/tmp/regions.json 2>/tmp/regions.err; then
   echo "--- oci stderr ---"; cat /tmp/regions.err
@@ -29,32 +29,40 @@ if ! oci iam region list --output json >/tmp/regions.json 2>/tmp/regions.err; th
 fi
 log "auth OK ($(jq -r '.data|length' /tmp/regions.json) regions visible)"
 
-C="${TENANCY:-}"
-if [ -z "$C" ] && [ -f "$HOME/.oci/config" ]; then
-  C=$(grep -m1 -Ei '^[[:space:]]*tenancy[[:space:]]*=' "$HOME/.oci/config" | cut -d= -f2- | tr -d ' "\r' || true)
+CONF="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
+CONF_TENANCY=""
+if [ -f "$CONF" ]; then
+  CONF_TENANCY=$(grep -m1 -Ei '^[[:space:]]*tenancy[[:space:]]*=' "$CONF" | cut -d= -f2- | tr -d ' "\r' || true)
 fi
-if [ -z "$C" ]; then
-  C=$(oci iam compartment list --all --query 'data[0]."compartment-id"' --raw-output 2>/dev/null || true)
-fi
-if [ -z "$C" ]; then
-  C=$(oci iam region-subscription list --output json 2>/dev/null | jq -r '.data[0]."tenancy-id" // empty' || true)
-fi
-if [ -z "$C" ]; then
-  C=$(oci iam tenancy list --output json 2>/dev/null | jq -r '.data[0].id // empty' || true)
-fi
-if [ -z "$C" ] && [ -f "$HOME/.oci/config" ]; then
-  echo "--- ~/.oci/config keys (values hidden) ---"
-  sed -E 's/^([a-z_]+)=.*/\1=***/' "$HOME/.oci/config" 2>/dev/null || true
-fi
-[ -n "$C" ] && [ "$C" != "null" ] || die "could not resolve tenancy OCID (pass TENANCY=ocid1.tenancy... )"
-log "tenancy=$C"
 
-REGION="${REGION:-$(grep -m1 '^region=' "$HOME/.oci/config" 2>/dev/null | cut -d= -f2- | tr -d ' \r' || true)}"
-[ -n "$REGION" ] || REGION=$(oci iam region-subscription list --output json 2>/dev/null | jq -r '.data[0]."region-name" // empty')
-log "region=${REGION:-<default>}"
+REGION="${REGION:-${OCI_REGION:-}}"
+if [ -z "$REGION" ] && [ -f "$CONF" ]; then
+  REGION=$(grep -m1 -Ei '^[[:space:]]*region[[:space:]]*=' "$CONF" | cut -d= -f2- | tr -d ' \r' || true)
+fi
+log "region=${REGION:-<cli default>}"
 
-AD=$(oci iam availability-domain list -c "$C" --output json | jq -r '.data[0].name')
-[ -n "$AD" ] && [ "$AD" != "null" ] || die "could not resolve availability domain"
+# Try every tenancy candidate until one actually authorizes. A wrong OCID
+# returns 404 NotAuthorizedOrNotFound, which is indistinguishable from a typo,
+# so we validate rather than trust.
+C=""; AD=""
+for cand in ${EXPLICIT_TENANCY:-} ${OCI_TENANCY:-} ${TENANCY:-} ${CONF_TENANCY:-}; do
+  [ -n "$cand" ] || continue
+  ad=$(oci iam availability-domain list -c "$cand" --output json 2>/dev/null | jq -r '.data[0].name // empty' || true)
+  if [ -n "$ad" ]; then
+    C="$cand"; AD="$ad"
+    log "tenancy=$C  (verified)"
+    break
+  fi
+  log "tenancy candidate rejected: ${cand:0:72}..."
+done
+if [ -z "$C" ]; then
+  echo "--- candidates tried ---"
+  echo "OCI_TENANCY=${OCI_TENANCY:-<unset>}"
+  echo "TENANCY=${TENANCY:-<unset>}"
+  echo "config($CONF)=${CONF_TENANCY:-<unset>}"
+  [ -f "$CONF" ] && { echo "--- config keys ---"; sed -E 's/^([a-zA-Z_]+)[[:space:]]*=.*/\1=***/' "$CONF"; }
+  die "no working tenancy OCID (pass EXPLICIT_TENANCY=ocid1.tenancy...)"
+fi
 log "AD=$AD"
 
 # ---------------- already deployed? ----------------
